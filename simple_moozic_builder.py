@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -860,7 +861,96 @@ def _audio_trace(msg: str) -> None:
         pass
 
 
+# --- Safe output writing -----------------------------------------------------
+# Encoders write to "<name>.ogg.part" and we only rename it onto the real name
+# once the encode finished. If the app is killed mid-song (or the encoder dies)
+# the half-written file is never mistaken for a finished conversion, and the
+# ".part" suffix keeps the song scanners (which look for ".ogg") from seeing it.
+
+def _part_path(target: Path) -> Path:
+    return target.with_name(target.name + ".part")
+
+
+def _discard(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+@contextmanager
+def _atomic_output(target: Path):
+    """Yield a temp path to write to; move it onto `target` only if the block succeeds."""
+    part = _part_path(target)
+    _discard(part)
+    try:
+        yield part
+        os.replace(part, target)
+    except BaseException:
+        _discard(part)
+        raise
+
+
+def _run_ffmpeg_to_ogg(cmd_head: list[str], target: Path) -> "subprocess.CompletedProcess[str]":
+    """Run ffmpeg (args up to, but not including, the output file) into a .part file.
+
+    The part file is renamed onto `target` only when ffmpeg exits cleanly. "-f ogg"
+    is explicit because ffmpeg can't guess the container from a ".part" name.
+    """
+    part = _part_path(target)
+    _discard(part)
+    # CREATE_NO_WINDOW stops a console window flashing up for every file in a big batch.
+    completed = subprocess.run(
+        cmd_head + ["-f", "ogg", str(part)],
+        capture_output=True,
+        text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode == 0:
+        try:
+            os.replace(part, target)
+        except BaseException:
+            _discard(part)
+            raise
+    else:
+        _discard(part)
+    return completed
+
+
+def _ogg_is_complete(path: Path) -> bool:
+    """Cheap check that an .ogg was fully written: its last page carries the end-of-stream flag.
+
+    Older versions wrote straight to the final name, so a killed run could leave a
+    truncated file that looked "up to date" by timestamp. This lets us spot those
+    and re-convert them instead of trusting them.
+    """
+    try:
+        size = path.stat().st_size
+        if size < 64:
+            return False
+        with path.open("rb") as f:
+            if f.read(4) != b"OggS":
+                return False
+            # Final pages are usually tiny, so try a small tail first. A page can be up to
+            # ~64KB though, so fall back to a bigger read only if no page header showed up.
+            for tail_bytes in (4096, 70000):
+                f.seek(max(0, size - tail_bytes))
+                tail = f.read()
+                i = tail.rfind(b"OggS")
+                if i >= 0 and len(tail) > i + 5:
+                    # Byte 5 of an Ogg page header is the flag byte; bit 0x04 = last page of the stream.
+                    return bool(tail[i + 5] & 0x04)
+        return False
+    except OSError:
+        return False
+
+
 def _resample_pcm16(data: "np.ndarray", src_rate: int, dst_rate: int) -> "np.ndarray":
+    """Linear resample of int16 PCM, done in chunks so long tracks don't spike memory.
+
+    The old version built full-length float64 position arrays for the whole song;
+    on a 10+ minute track that was hundreds of MB. Same maths, bounded chunks.
+    """
     if src_rate == dst_rate:
         return data
     if data.size == 0:
@@ -868,12 +958,20 @@ def _resample_pcm16(data: "np.ndarray", src_rate: int, dst_rate: int) -> "np.nda
     frames = data.shape[0]
     channels = data.shape[1]
     out_frames = max(1, int(round(frames * (dst_rate / src_rate))))
-    x_old = np.linspace(0.0, 1.0, num=frames, endpoint=False)
-    x_new = np.linspace(0.0, 1.0, num=out_frames, endpoint=False)
-    out = np.empty((out_frames, channels), dtype=np.float32)
-    for c in range(channels):
-        out[:, c] = np.interp(x_new, x_old, data[:, c].astype(np.float32))
-    return np.clip(out, -32768, 32767).astype(np.int16)
+    out = np.empty((out_frames, channels), dtype=np.int16)
+    ratio = frames / out_frames
+    last = frames - 1
+    step = 1 << 20  # ~1M output frames per pass
+    for start in range(0, out_frames, step):
+        stop = min(out_frames, start + step)
+        pos = np.arange(start, stop, dtype=np.float64) * ratio
+        i0 = np.minimum(pos.astype(np.int64), last)
+        i1 = np.minimum(i0 + 1, last)
+        frac = (pos - i0).astype(np.float32)[:, None]
+        a = data[i0].astype(np.float32)
+        b = data[i1].astype(np.float32)
+        out[start:stop] = np.clip(a + (b - a) * frac, -32768, 32767).astype(np.int16)
+    return out
 
 
 def _decode_to_pcm16(source: Path, target_rate: int = 44100, target_channels: int = 2) -> tuple["np.ndarray", int]:
@@ -927,20 +1025,22 @@ def _convert_with_soundfile(source: Path, target: Path) -> None:
         raise SystemExit("soundfile backend unavailable (requires soundfile + numpy).")
     pcm, sr = _decode_to_pcm16(source, target_rate=44100, target_channels=2)
     target.parent.mkdir(parents=True, exist_ok=True)
-    with sf.SoundFile(
-        str(target),
-        mode="w",
-        samplerate=sr,
-        channels=2,
-        format="OGG",
-        subtype="VORBIS",
-    ) as out_sf:
-        if pcm.shape[0] == 0:
-            return
-        frame_step = 16384
-        for i in range(0, pcm.shape[0], frame_step):
-            chunk = np.ascontiguousarray(pcm[i : i + frame_step], dtype=np.int16)
-            out_sf.buffer_write(chunk.tobytes(), dtype="int16")
+    # Encode into a .part file; it only becomes `target` if we get all the way through.
+    with _atomic_output(target) as part:
+        with sf.SoundFile(
+            str(part),
+            mode="w",
+            samplerate=sr,
+            channels=2,
+            format="OGG",
+            subtype="VORBIS",
+        ) as out_sf:
+            if pcm.shape[0] == 0:
+                return
+            frame_step = 16384
+            for i in range(0, pcm.shape[0], frame_step):
+                chunk = np.ascontiguousarray(pcm[i : i + frame_step], dtype=np.int16)
+                out_sf.buffer_write(chunk.tobytes(), dtype="int16")
 
 
 def _create_mix_with_soundfile(source_files: list[Path], out_path: Path) -> None:
@@ -948,28 +1048,30 @@ def _create_mix_with_soundfile(source_files: list[Path], out_path: Path) -> None
         raise SystemExit("soundfile backend unavailable (requires soundfile + numpy).")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Stream chunks into encoder to avoid one huge write call that can crash.
-    with sf.SoundFile(
-        str(out_path),
-        mode="w",
-        samplerate=44100,
-        channels=2,
-        format="OGG",
-        subtype="VORBIS",
-    ) as out_sf:
-        _audio_trace(f"soundfile mix start: out={out_path} sources={len(source_files)}")
-        for src in source_files:
-            _audio_trace(f"decode start: {src}")
-            pcm, _ = _decode_to_pcm16(src, target_rate=44100, target_channels=2)
-            if pcm.shape[0] == 0:
-                _audio_trace(f"skip empty: {src}")
-                continue
-            frame_step = 16384
-            _audio_trace(f"write start: {src} frames={pcm.shape[0]}")
-            for i in range(0, pcm.shape[0], frame_step):
-                chunk = np.ascontiguousarray(pcm[i : i + frame_step], dtype=np.int16)
-                out_sf.buffer_write(chunk.tobytes(), dtype="int16")
-            _audio_trace(f"write done: {src}")
-        _audio_trace(f"soundfile mix done: out={out_path}")
+    # Written to a .part file and renamed at the end so a failed mix leaves nothing behind.
+    with _atomic_output(out_path) as part:
+        with sf.SoundFile(
+            str(part),
+            mode="w",
+            samplerate=44100,
+            channels=2,
+            format="OGG",
+            subtype="VORBIS",
+        ) as out_sf:
+            _audio_trace(f"soundfile mix start: out={out_path} sources={len(source_files)}")
+            for src in source_files:
+                _audio_trace(f"decode start: {src}")
+                pcm, _ = _decode_to_pcm16(src, target_rate=44100, target_channels=2)
+                if pcm.shape[0] == 0:
+                    _audio_trace(f"skip empty: {src}")
+                    continue
+                frame_step = 16384
+                _audio_trace(f"write start: {src} frames={pcm.shape[0]}")
+                for i in range(0, pcm.shape[0], frame_step):
+                    chunk = np.ascontiguousarray(pcm[i : i + frame_step], dtype=np.int16)
+                    out_sf.buffer_write(chunk.tobytes(), dtype="int16")
+                _audio_trace(f"write done: {src}")
+            _audio_trace(f"soundfile mix done: out={out_path}")
 
 
 def _candidate_binary_paths(binary_name: str) -> list[Path]:
@@ -1023,7 +1125,11 @@ def refresh_song_catalog(audio_dir: Path) -> list[AudioTrackEntry]:
         else:
             src_mtime = src.stat().st_mtime
             dst_mtime = target.stat().st_mtime
-            if dst_mtime >= src_mtime:
+            if dst_mtime >= src_mtime and not _ogg_is_complete(target):
+                # Newer than the source but cut short (an interrupted conversion): redo it.
+                status = "stale"
+                detail = "incomplete, needs re-convert"
+            elif dst_mtime >= src_mtime:
                 status = "ready"
                 detail = "up-to-date"
             else:
@@ -1102,7 +1208,8 @@ def convert_audio_library(
 
     for src in sources:
         target = cache_root / f"{src.stem}.ogg"
-        up_to_date = target.exists() and target.stat().st_mtime >= src.stat().st_mtime
+        # A truncated leftover from an interrupted run doesn't count as up to date.
+        up_to_date = target.exists() and target.stat().st_mtime >= src.stat().st_mtime and _ogg_is_complete(target)
         if not force and up_to_date:
             entry = AudioTrackEntry(source=src, ogg=target, status="ready", detail="up-to-date")
             summary["skipped"] += 1
@@ -1112,7 +1219,8 @@ def convert_audio_library(
 
         if src.suffix.lower() == ".ogg":
             if src.resolve() != target.resolve():
-                shutil.copy2(src, target)
+                with _atomic_output(target) as part:
+                    shutil.copy2(src, part)
             summary["copied"] += 1
             entry = AudioTrackEntry(source=src, ogg=target, status="ready", detail="copied")
             if progress_cb:
@@ -1154,9 +1262,8 @@ def convert_audio_library(
                 "libvorbis",
                 "-q:a",
                 "5",
-                str(target),
             ]
-            completed = subprocess.run(cmd, capture_output=True, text=True)
+            completed = _run_ffmpeg_to_ogg(cmd, target)
             if completed.returncode != 0:
                 summary["failed"] += 1
                 detail_err = (completed.stderr or completed.stdout or "ffmpeg failed").strip()
@@ -1250,10 +1357,9 @@ def create_song_from_sources(
                 "libvorbis",
                 "-q:a",
                 "5",
-                str(out_path),
             ]
         )
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = _run_ffmpeg_to_ogg(cmd, out_path)
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "ffmpeg failed").strip()
             raise SystemExit(f"ffmpeg failed creating song: {err}")
@@ -1282,7 +1388,8 @@ def convert_single_audio_file(source_file: Path, audio_dir: Path, force: bool = 
     prefer_soundfile = backend_mode != "ffmpeg"
     ffmpeg = _locate_ffmpeg()
     target = cache_root / f"{src.stem}.ogg"
-    up_to_date = target.exists() and target.stat().st_mtime >= src.stat().st_mtime
+    # Timestamp alone isn't enough: a killed run can leave a truncated file that's "newer" than the source.
+    up_to_date = target.exists() and target.stat().st_mtime >= src.stat().st_mtime and _ogg_is_complete(target)
     if not force and up_to_date:
         return AudioTrackEntry(source=src, ogg=target, status="ready", detail="up-to-date")
 
@@ -1314,9 +1421,8 @@ def convert_single_audio_file(source_file: Path, audio_dir: Path, force: bool = 
         "libvorbis",
         "-q:a",
         "5",
-        str(target),
     ]
-    completed = subprocess.run(cmd, capture_output=True, text=True)
+    completed = _run_ffmpeg_to_ogg(cmd, target)
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "ffmpeg failed").strip()
         raise SystemExit(f"ffmpeg conversion failed: {detail}")
@@ -2418,7 +2524,10 @@ def build_mixed_from_config(config: dict, on_track: Optional[Callable[[BuildTrac
                             converted = convert_single_audio_file(src, base_audio_dir, force=False)
                             if converted.ogg.exists():
                                 ogg_path = converted.ogg
-                        except Exception:
+                        except (Exception, SystemExit):
+                            # Conversion problems surface as SystemExit, which a plain
+                            # `except Exception` lets through and aborts the whole build.
+                            # A song that can't be converted is skipped instead.
                             ogg_path = None
         if ogg_path is None:
             cache_override = mode_cfg.get("cached_ogg_path")

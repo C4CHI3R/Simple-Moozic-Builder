@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import random
 import shutil
 import subprocess
@@ -30,6 +31,7 @@ except Exception:
     miniaudio = None
 
 from simple_moozic_builder import (
+    _ogg_is_complete,
     _safe_song_stem,
     AudioTrackEntry,
     BuildTrackEvent,
@@ -59,6 +61,13 @@ RECENT_LIMIT = 20
 CRASH_LOG_FILENAME = "simple_moozic_builder_crash.log"
 FATAL_LOG_FILENAME = "simple_moozic_builder_fatal.log"
 MAX_PREVIEW_TILES = 80
+# How long the song list may go without a repaint while a big conversion is streaming
+# results in. Redrawing every row after every song is what made large packs crawl.
+TREE_REFRESH_INTERVAL_S = 1.0
+
+
+class _BuildCancelled(Exception):
+    """Raised from inside the build worker (via the per-track callback) to stop a build early."""
 
 KEYCODE_A = 65
 KEYCODE_S = 83
@@ -293,6 +302,23 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         self.sort_state: dict[str, bool] = {}
         self._native_dialog_active = False
 
+        # Converting and building run on a worker thread so the window keeps repainting
+        # (otherwise Windows flags it "Not Responding" on big packs). The worker never
+        # touches Tk widgets; it posts messages to this queue and the UI thread drains it.
+        self._job_queue: queue.Queue | None = None
+        self._job_cancel = threading.Event()
+        self._job_busy = False
+        self._job_kind = ""  # "convert" or "build"
+        self._job_then = None  # runs on the UI thread once a convert job finishes cleanly
+        self._job_after_id = None
+        self._tree_dirty = False
+        self._tree_last_redraw = 0.0
+        self._convert_rows_by_source: dict[str, list[dict]] = {}
+        self._convert_total = 0
+        self._convert_done = 0
+        self._convert_failures: list[tuple[str, str]] = []
+        self.build_button = None
+
         self._load_recent_projects()
         self._build_layout()
         self._apply_window_icon(self)
@@ -478,13 +504,15 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         btn_mix.pack(side="left", padx=(0, 6))
         Tooltip(btn_mix, "Create Mix")
 
-        ctk.CTkButton(
+        # Kept on self: while a job runs this button turns into "Cancel".
+        self.build_button = ctk.CTkButton(
             controls_row,
             text="Build",
             width=96,
             command=self.build_pack,
             font=ctk.CTkFont(weight="bold"),
-        ).pack(side="right", padx=(6, 0))
+        )
+        self.build_button.pack(side="right", padx=(6, 0))
         self._refresh_global_vinyl_mask_button()
 
         songs = ctk.CTkFrame(left)
@@ -886,6 +914,9 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         self.refresh_songs()
 
     def on_close(self) -> None:
+        # Tell any running convert/build to stop. The worker is a daemon thread, and
+        # conversions write to .part files, so quitting mid-job cannot leave a bad .ogg.
+        self._job_cancel.set()
         self.stop_preview()
         self._hide_hover_tip()
         for proc in list(self._aux_preview_procs):
@@ -940,6 +971,8 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         try:
             src_mtime = source.stat().st_mtime
             ogg_mtime = ogg.stat().st_mtime
+            if ogg_mtime >= src_mtime and not _ogg_is_complete(ogg):
+                return "stale", "incomplete, needs re-convert"
             if ogg_mtime >= src_mtime:
                 return "ready", "up-to-date"
             return "stale", "source newer"
@@ -1065,6 +1098,9 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         self.status_var.set(f"Cleared B-side on {len(selected)} song(s)")
 
     def convert_selected_songs(self) -> None:
+        if self._job_busy:
+            self.status_var.set("Already working - wait for it to finish or press Cancel")
+            return
         selected = self._selected_keys()
         if not selected:
             return
@@ -1660,6 +1696,10 @@ class SimpleMoozicBuilderUI(ctk.CTk):
             self.poster_thumb_top = None
 
     def manual_refresh_songs(self) -> None:
+        if self._job_busy:
+            # A refresh mid-conversion would swap the rows out from under the worker's results.
+            self.status_var.set("Already working - wait for it to finish or press Cancel")
+            return
         self.refresh_songs()
 
     def refresh_songs(self) -> None:
@@ -2302,64 +2342,252 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         self._redraw_tree()
         self.status_var.set("All songs set to mod default cover")
 
-    def convert_audio(self) -> bool:
+    # ---- Background conversion / build ---------------------------------------
+    # Flow: build_pack -> convert_audio (worker thread) -> _start_build (worker thread).
+    # Each worker only posts tuples to self._job_queue; _pump_job_queue runs on the UI
+    # thread, applies them to widgets, and is the only place Tk state gets touched.
+
+    def _set_job_running(self, running: bool) -> None:
+        self._job_busy = running
+        if self.build_button is None:
+            return
+        if running:
+            self.build_button.configure(text="Cancel", command=self.cancel_job)
+        else:
+            self.build_button.configure(text="Build", command=self.build_pack)
+
+    def cancel_job(self) -> None:
+        if not self._job_busy:
+            return
+        # The worker checks this between songs / tracks, so it stops at the next boundary.
+        self._job_cancel.set()
+        self.status_var.set("Cancelling...")
+
+    def _start_job(self, kind: str, target, args: tuple, then=None) -> None:
+        self._job_kind = kind
+        self._job_queue = queue.Queue()
+        self._job_cancel = threading.Event()
+        self._job_then = then
+        self._set_job_running(True)
+        threading.Thread(
+            target=target,
+            args=(*args, self._job_queue, self._job_cancel),
+            daemon=True,
+            name=f"smb-{kind}",
+        ).start()
+        self._job_after_id = self.after(40, self._pump_job_queue)
+
+    def _pump_job_queue(self) -> None:
+        self._job_after_id = None
+        q = self._job_queue
+        if q is None:
+            return
+        # Work through messages for a short slice, then hand control back to Tk so the
+        # window stays responsive even when the worker is producing results quickly.
+        deadline = time.monotonic() + 0.03
+        finished = False
+        while time.monotonic() < deadline:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            if self._handle_job_message(msg):
+                finished = True
+                break
+        self._flush_tree_if_due(force=finished)
+        # If a finished convert job chained straight into a build, _start_job already
+        # scheduled its own pump, so only reschedule while this job is still going.
+        if not finished:
+            self._job_after_id = self.after(40, self._pump_job_queue)
+
+    def _flush_tree_if_due(self, force: bool = False) -> None:
+        if not self._tree_dirty:
+            return
+        now = time.monotonic()
+        if force or now - self._tree_last_redraw >= TREE_REFRESH_INTERVAL_S:
+            self._redraw_tree()
+            self._tree_dirty = False
+            self._tree_last_redraw = now
+
+    def _handle_job_message(self, msg: tuple) -> bool:
+        """Apply one worker message on the UI thread. Returns True when the job is over."""
+        kind = msg[0]
+        if kind == "converted":
+            _, key, entry = msg
+            self._convert_done += 1
+            for row in self._convert_rows_by_source.get(key, ()):
+                row["ogg"] = entry.ogg
+                row["status"] = entry.status
+                row["detail"] = entry.detail
+            self._tree_dirty = True
+            self._show_convert_progress()
+            return False
+        if kind == "convert_failed":
+            _, key, src, text = msg
+            self._convert_done += 1
+            self._convert_failures.append((Path(src).name, text))
+            for row in self._convert_rows_by_source.get(key, ()):
+                row["status"] = "failed"
+                row["detail"] = text
+            self._tree_dirty = True
+            self._show_convert_progress()
+            return False
+        if kind == "convert_done":
+            self._finish_convert()
+            return True
+        if kind == "tile":
+            self._add_preview_tile(msg[1])
+            return False
+        if kind == "built":
+            self._finish_build(msg[1])
+            return True
+        if kind == "error":
+            self._finish_build_error(msg[1])
+            return True
+        if kind == "cancelled":
+            self._finish_cancelled()
+            return True
+        return False
+
+    def _show_convert_progress(self) -> None:
+        total = max(1, self._convert_total)
+        self.build_progress_var.set(max(0.0, min(1.0, self._convert_done / total)))
+        self.status_var.set(f"Converting songs... ({self._convert_done}/{self._convert_total})")
+
+    def convert_audio(self, then=None) -> None:
+        """Convert every listed song to .ogg on a worker thread.
+
+        `then` (optional) is called on the UI thread after a clean finish; build_pack uses
+        it to continue straight into the build.
+        """
+        if self._job_busy:
+            self.status_var.set("Already working - wait for it to finish or press Cancel")
+            return
         self.audio_dir_active = self._pick_active_audio_dir()
         all_rows = list(self.track_rows)
-        total_sources = len(all_rows)
 
-        if total_sources <= 0:
+        # Group rows by source file once, up front. Several rows can share a source, and
+        # looking results up in a dict keeps this linear instead of rescanning every row
+        # (with a filesystem resolve each) for every converted song.
+        rows_by_source: dict[str, list[dict]] = {}
+        jobs: list[tuple[str, Path]] = []
+        for row in all_rows:
+            key = str(row["source"].resolve())
+            if key not in rows_by_source:
+                rows_by_source[key] = []
+                jobs.append((key, row["source"]))
+            rows_by_source[key].append(row)
+
+        if not jobs:
             self.status_var.set("No songs found to convert")
-            return True
+            if then is not None:
+                then()
+            return
 
+        self._convert_rows_by_source = rows_by_source
+        self._convert_total = len(jobs)
+        self._convert_done = 0
+        self._convert_failures = []
         self.preview_title_label.configure(text="Converting Songs (Please Wait)...")
         self.build_progress_var.set(0.0)
-        self.status_var.set("Converting songs...")
-        self.update_idletasks()
+        self.status_var.set(f"Converting songs... (0/{self._convert_total})")
+        self._start_job("convert", self._convert_worker, (jobs, self.audio_dir_active), then=then)
 
-        processed = 0
-        seen_sources: set[str] = set()
+    def _convert_worker(self, jobs, audio_dir, q: queue.Queue, cancel: threading.Event) -> None:
+        for key, src in jobs:
+            if cancel.is_set():
+                q.put(("cancelled",))
+                return
+            try:
+                entry = convert_single_audio_file(src, audio_dir, force=False)
+            except (SystemExit, Exception) as e:  # the engine reports conversion problems via SystemExit
+                # One bad file should not throw away the rest of a big batch; we collect
+                # these and show them together at the end.
+                q.put(("convert_failed", key, src, str(e) or type(e).__name__))
+            else:
+                q.put(("converted", key, entry))
+        q.put(("convert_done",))
 
-        def _on_progress(entry) -> None:
-            nonlocal processed
-            processed += 1
-            src_resolved = str(entry.source.resolve()) if entry and entry.source else ""
-            for row in self.track_rows:
-                try:
-                    if str(row["source"].resolve()) == src_resolved:
-                        row["ogg"] = entry.ogg
-                        row["status"] = entry.status
-                        row["detail"] = entry.detail
-                except Exception:
-                    pass
-            self._redraw_tree()
-            self.build_progress_var.set(max(0.0, min(1.0, processed / total_sources)))
-            self.status_var.set(f"Converting songs... ({processed}/{total_sources})")
-            self.update_idletasks()
+    def _finish_convert(self) -> None:
+        then = self._job_then
+        self._job_then = None
+        self._set_job_running(False)
+        self.preview_title_label.configure(text="Build Preview")
+        failures = list(self._convert_failures)
+        self.refresh_songs()  # pick up the fresh .ogg files
+        self.build_progress_var.set(1.0)
+
+        if not failures:
+            self.status_var.set("Converting Complete")
+            if then is not None:
+                then()
+            return
+
+        shown = "\n".join(f"- {name}: {text[:160]}" for name, text in failures[:8])
+        extra = f"\n...and {len(failures) - 8} more" if len(failures) > 8 else ""
+        summary = f"{len(failures)} song(s) could not be converted:\n\n{shown}{extra}"
+        if then is None:
+            messagebox.showwarning("Some songs failed to convert", summary)
+            self.status_var.set(f"Converting finished, {len(failures)} failed")
+            return
+        if messagebox.askyesno("Some songs failed to convert", f"{summary}\n\nBuild the pack without them?"):
+            self.status_var.set(f"Converting finished, {len(failures)} failed - building the rest")
+            then()
+        else:
+            self.status_var.set("Build stopped: some songs failed to convert")
+
+    def _build_worker(self, config: dict, q: queue.Queue, cancel: threading.Event) -> None:
+        def on_track(event: BuildTrackEvent) -> None:
+            # Called by the engine after each track; raising here unwinds the build
+            # (its temp folder is cleaned up by the engine's own context manager).
+            if cancel.is_set():
+                raise _BuildCancelled()
+            q.put(("tile", event))
 
         try:
-            for row in all_rows:
-                src = row["source"]
-                src_key = str(src.resolve())
-                if src_key in seen_sources:
-                    continue
-                seen_sources.add(src_key)
-                entry = convert_single_audio_file(src, self.audio_dir_active, force=False)
-                _on_progress(entry)
+            out = build_mixed_from_config(config, on_track=on_track)
+        except _BuildCancelled:
+            q.put(("cancelled",))
         except SystemExit as e:
-            messagebox.showerror("Audio Conversion Error", str(e))
-            self.status_var.set("Conversion failed")
-            return False
+            q.put(("error", str(e) or "Build stopped"))
         except Exception as e:
-            messagebox.showerror("Audio Conversion Error", str(e))
-            self.status_var.set("Conversion failed")
-            return False
-        finally:
-            self.preview_title_label.configure(text="Build Preview")
+            _write_crash_log(type(e), e, e.__traceback__, context="Build worker")
+            q.put(("error", str(e) or type(e).__name__))
+        else:
+            q.put(("built", out))
 
-        self.refresh_songs()
+    def _end_build_progress(self) -> None:
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate")
+
+    def _finish_build(self, out) -> None:
+        self._set_job_running(False)
+        self._end_build_progress()
+        self.final_output_dir = out
         self.build_progress_var.set(1.0)
-        self.status_var.set("Converting Complete")
-        return True
+        cassette_count, vinyl_count = self._compute_generation_counts()
+        self.completion_var.set(f"Cassettes \U0001F4FC - {cassette_count}    Vinyls \U0001F4BF - {vinyl_count}")
+        self.status_var.set(f"Build complete: {out}")
+
+    def _finish_build_error(self, text: str) -> None:
+        self._set_job_running(False)
+        self._end_build_progress()
+        messagebox.showerror("Build Error", text)
+        self.status_var.set("Build failed")
+
+    def _finish_cancelled(self) -> None:
+        was_convert = self._job_kind == "convert"
+        self._job_then = None
+        self._set_job_running(False)
+        self._end_build_progress()
+        self.preview_title_label.configure(text="Build Preview")
+        if was_convert:
+            # Keep whatever finished; the next run skips those (they are up to date).
+            done = self._convert_done
+            self.refresh_songs()
+            self.status_var.set(f"Cancelled - {done} of {self._convert_total} song(s) converted")
+        else:
+            self.status_var.set("Build cancelled")
 
     def _preflight(self) -> list[str]:
         errors: list[str] = []
@@ -2375,7 +2603,8 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         return errors
 
     def _compute_generation_counts(self) -> tuple[int, int]:
-        present_keys = {row["ogg"].name for row in self.track_rows}
+        # Only songs with a real .ogg made it into the pack; skipped (failed) ones shouldn't be counted.
+        present_keys = {row["ogg"].name for row in self.track_rows if row["ogg"].exists()}
         cassette_count = 0
         vinyl_count = 0
         for key, cfg in self.track_settings.items():
@@ -2474,7 +2703,6 @@ class SimpleMoozicBuilderUI(ctk.CTk):
                     text=f"Preview limited to first {MAX_PREVIEW_TILES} songs for stability.",
                     anchor="w",
                 ).pack(side="left", fill="x", expand=True, padx=6, pady=6)
-            self.update_idletasks()
             return
 
         tile = ctk.CTkFrame(self.preview_scroll)
@@ -2513,19 +2741,19 @@ class SimpleMoozicBuilderUI(ctk.CTk):
 
         ctk.CTkLabel(tile, text=title, anchor="w").pack(side="left", fill="x", expand=True, padx=4)
 
-        self.update_idletasks()
-
     def build_pack(self) -> None:
+        if self._job_busy:
+            return
         self.audio_dir_active = self._pick_active_audio_dir()
         errors = self._preflight()
         if errors:
             messagebox.showerror("Preflight failed", "\n".join(errors))
             self.status_var.set("Preflight failed")
             return
-        if not self.convert_audio():
-            self.status_var.set("Build stopped: conversion failed")
-            return
+        # Convert first (worker thread); _start_build runs once that finishes cleanly.
+        self.convert_audio(then=self._start_build)
 
+    def _start_build(self) -> None:
         for child in self.preview_scroll.winfo_children():
             child.destroy()
         self.preview_images.clear()
@@ -2535,28 +2763,16 @@ class SimpleMoozicBuilderUI(ctk.CTk):
         self.build_progress_var.set(0)
         self.status_var.set("Building (please wait)...")
 
+        # The config is plain data built here on the UI thread (it reads Tk variables),
+        # so the worker never has to touch a widget.
         try:
-            out = build_mixed_from_config(self._build_config(), on_track=self._add_preview_tile)
-        except SystemExit as e:
-            self.progress_bar.stop()
-            self.progress_bar.configure(mode="determinate")
-            messagebox.showerror("Build Error", str(e) or "Build stopped")
-            self.status_var.set("Build failed")
-            return
+            config = self._build_config()
         except Exception as e:
-            self.progress_bar.stop()
-            self.progress_bar.configure(mode="determinate")
+            self._end_build_progress()
             messagebox.showerror("Build Error", str(e))
             self.status_var.set("Build failed")
             return
-
-        self.progress_bar.stop()
-        self.progress_bar.configure(mode="determinate")
-        self.final_output_dir = out
-        self.build_progress_var.set(1.0)
-        cassette_count, vinyl_count = self._compute_generation_counts()
-        self.completion_var.set(f"Cassettes \U0001F4FC - {cassette_count}    Vinyls \U0001F4BF - {vinyl_count}")
-        self.status_var.set(f"Build complete: {out}")
+        self._start_job("build", self._build_worker, (config,))
 
     def clear_preview(self) -> None:
         confirm = messagebox.askyesno(
